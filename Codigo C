@@ -1,129 +1,313 @@
+/*
+  NEXUS ACCESS CONTROL 
+  Central de seguranca simulada apenas com PORTAS LOGICAS.
+ 
+  ENTRADAS (4)
+    C = Cartao RFID autorizado
+    H = Horario comercial (RTC: 08h <= hora < 18h)
+    M = Sensor de movimento interno (PIR)
+    P = Sensor magnetico: porta fisicamente aberta
+ 
+  SAIDAS (4)
+    S1 TRAVA  = C . H . /Q
+    S2 SIRENE = Q  (latch: alarme memorizado ate o sistema ser rearmado)
+    S3 LOG    = H . (TRAVA xor M)
+    S4 CAMERA = ALARME_COND + LOG
+ 
+  Equacoes booleanas:
+    FORA_HORA   = /H
+    FORCADA     = P . /TRAVA
+    ALARME_COND = /H.(C+M+P) + FORCADA
+    Q+          = ALARME_COND + Q          (latch: uma vez ligado, se mantem;
+                                            o rearme e feito pelo menu)
+ */
+
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <errno.h>
 
-// Definicoes de Firmware / Hardware
 #define EXPEDIENTE_INICIO 8
-#define EXPEDIENTE_FIM    18
+#define EXPEDIENTE_FIM    18   // exclusivo: 17:59 ainda e expediente
 
-typedef int bit; // Tipo semantico para sinais digitais (0 ou 1)
+typedef int bit;               // sinal digital: 0 ou 1
 
-// Estrutura que representa o barramento de dados da central
+// ------------ BIBLIOTECA DE PORTAS --------------
+static bit NOT_(bit a)         { return !a; }
+static bit AND_(bit a, bit b)  { return a && b; }
+static bit OR_ (bit a, bit b)  { return a || b; }
+static bit XOR_(bit a, bit b)  { return a != b; }
+static bit NAND_(bit a, bit b) { return NOT_(AND_(a, b)); }
+static bit NOR_ (bit a, bit b) { return NOT_(OR_(a, b)); }
+static bit XNOR_(bit a, bit b) { return NOT_(XOR_(a, b)); }
+
+// ESTRUTURAS
 typedef struct {
-    // 3 Entradas Digitais
-    bit in_cartao;      // C: Leitor RFID
-    bit in_horario;     // H: Relogio RTC (08h-18h)
-    bit in_movimento;   // M: Sensor PIR Interno
+    bit C, H, M, P;
+} Entradas;
 
-    // Sinais Intermediarios
-    bit sig_fora_hora;  // NOT H
-    bit sig_xor_audit;  // Porta XOR de auditoria
+typedef struct {
+    // intermediarios
+    bit fora_hora;
+    bit cred_ok;
+    bit forcada;
+    bit diverg;
+    bit alarme_cond;   // alarme "ao vivo", sem memoria
+    // saidas fisicas 
+    bit trava;         // S1 
+    bit sirene;        // S2 (latch)
+    bit log_audit;     // S3 
+    bit camera;        // S4 
+} Saidas;
 
-    // Saidas Fisicas
-    bit out_trava;      // Saida 1: Rele da Porta Eletrica
-    bit out_alarme;     // Saida 2: Sirene / Bloqueio Central
-    bit out_log_audit;  // Saida 3: Alerta silencioso no painel do guarda
-} CentralSeguranca;
+// NUCLEO LOGICO (so portas)
+// q_prev = estado anterior do latch (memoria do alarme)
+static Saidas avaliar(Entradas e, bit q_prev)
+{
+    Saidas s;
 
-// Nucleo de Processamento Logico (Apenas Portas Booleanas)
-CentralSeguranca executarMalhaLogica(bit C, int hora_rtc, bit M) {
-    CentralSeguranca sys;
+    s.fora_hora = NOT_(e.H);
+    s.cred_ok   = AND_(e.C, e.H);
 
-    // 1. Aquisicao das Entradas
-    sys.in_cartao    = (C != 0);
-    sys.in_horario   = (hora_rtc >= EXPEDIENTE_INICIO && hora_rtc <= EXPEDIENTE_FIM);
-    sys.in_movimento = (M != 0);
+    // S1: credencial valida, em horario e sem bloqueio central
+    s.trava = AND_(s.cred_ok, NOT_(q_prev));
 
-    // 2. Portas Logicas (NOT, AND, OR, XOR)
-    sys.sig_fora_hora = !sys.in_horario;                                      // Porta NOT
-    sys.out_trava     = sys.in_cartao && sys.in_horario;                      // Porta AND (Saida 1)
-    sys.sig_xor_audit = sys.out_trava ^ sys.in_movimento;                     // Porta XOR
+    // porta aberta sem a trava ter sido liberada = arrombamento
+    s.forcada = AND_(e.P, NOT_(s.trava));
 
-    // Saida 2 (OR + AND + NOT): Dispara sirene se estiver fora de hora E houver (cartao OU movimento)
-    sys.out_alarme    = sys.sig_fora_hora && (sys.in_cartao || sys.in_movimento);
+    // divergencia entre o que o sistema liberou e o que o PIR viu
+    s.diverg = XOR_(s.trava, e.M);
 
-    // Saida 3 (AND + XOR): Anomalia operacional durante o expediente
-    sys.out_log_audit = sys.in_horario && sys.sig_xor_audit;
+    // condicao de alarme (combinacional)
+    s.alarme_cond = OR_(AND_(s.fora_hora, OR_(OR_(e.C, e.M), e.P)),
+                        s.forcada);
 
-    return sys;
+    // S2: latch -> Q+ = SET + Q (se ja estava ligado, continua ligado)
+    s.sirene = OR_(s.alarme_cond, q_prev);
+
+    // S3: anomalia durante o expediente
+    s.log_audit = AND_(e.H, s.diverg);
+
+    // S4: grava sempre que houver alarme ou anomalia
+    s.camera = OR_(s.alarme_cond, s.log_audit);
+
+    return s;
 }
 
-void renderizarPainelCorporativo(CentralSeguranca s, int hora_rtc) {
-    printf("\n+-----------------------------------------------------------------------+\n");
-    printf("|  NEXUS ACCESS CONTROL v2.4  |  TELEMETRIA DE HARDWARE EM TEMPO REAL   |\n");
-    printf("+-----------------------------------------------------------------------+\n");
-    printf("| [ENTRADAS]  RFID (C): %d   |   RTC (H): %d [%02d:00h]   |   PIR (M): %d    |\n",
-           s.in_cartao, s.in_horario, hora_rtc, s.in_movimento);
-    printf("+-----------------------------------------------------------------------+\n");
-    printf("| [MALHA LOGICA]                                                        |\n");
-    printf("|   > AND  (C && H)             = %d  -> Rele da Porta Eletrica          |\n", s.out_trava);
-    printf("|   > NOT  (!H)                 = %d  -> Flag Fora de Expediente         |\n", s.sig_fora_hora);
-    printf("|   > XOR  (Trava ^ M)          = %d  -> Divergencia Fisica              |\n", s.sig_xor_audit);
-    printf("|   > OR   (!H && (C || M))     = %d  -> Acionamento de Sirene           |\n", s.out_alarme);
-    printf("+-----------------------------------------------------------------------+\n");
-    printf("| [SAIDAS FISICAS]                                                      |\n");
-    printf("|   SAIDA 1 [TRAVA ELETRICA] : %d  [ %-30s ]  |\n",
-           s.out_trava, s.out_trava ? "ENERGIZADA - PORTA ABERTA" : "BLOQUEADA - PORTA TRANCADA");
-    printf("|   SAIDA 2 [SIRENE ALARME]  : %d  [ %-30s ]  |\n",
-           s.out_alarme, s.out_alarme ? "DISPARADA - INTRUSAO/BLOQUEIO" : "INATIVA - SISTEMA ARMADO");
-    printf("|   SAIDA 3 [PAINEL GUARDA]  : %d  [ %-30s ]  |\n",
-           s.out_log_audit, s.out_log_audit ? "LOG DE AUDITORIA GERADO" : "OPERACAO PADRAO");
-    printf("+-----------------------------------------------------------------------+\n");
+// INTERFACE
+static void linha(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    printf("| %-69s |\n", buf);
+}
 
-    // Analise Semantica da Central
-    printf("\n[DIAGNOSTICO DA CENTRAL]: ");
-    if (s.out_trava && s.in_movimento) {
-        printf("ACESSO AUTORIZADO E CONFIRMADO. Colaborador validou RFID e adentrou o setor.\n");
-    } 
-    else if (s.out_log_audit && s.out_trava && !s.in_movimento) {
-        printf("ALERTA XOR (TIMEOUT): Credencial aceita, porem sensor PIR nao detectou passagem. Porta retrancada.\n");
-    } 
-    else if (s.out_log_audit && !s.out_trava && s.in_movimento) {
-        printf("ALERTA XOR (PRESENCA SEM CREDENCIAL): Movimento interno em horario comercial sem leitura recente na porta.\n");
-    } 
-    else if (s.out_alarme && s.in_cartao && s.in_movimento) {
-        printf("VIOLACAO CRITICA: Tentativa de acesso fora de horario COM movimento interno simultaneo!\n");
-    } 
-    else if (s.out_alarme && s.in_cartao) {
-        printf("BLOQUEIO DE PERIODO: Credencial valida rejeitada pelo relogio RTC (%02dh fora de 08h-18h).\n", hora_rtc);
-    } 
-    else if (s.out_alarme && s.in_movimento) {
-        printf("INTRUSAO PERIMETRAL: Movimento detectado na area restrita sem abertura de porta fora do expediente!\n");
-    } 
-    else {
-        printf("STANDBY: Perimetro seguro, sem eventos ativos.\n");
+static void borda(void)
+{
+    printf("-------------------------------------------------------------------------\n");
+}
+
+static const char *diagnostico(Entradas e, Saidas s)
+{
+    if (s.forcada)
+        return "ARROMBAMENTO: porta aberta sem liberacao da trava!";
+    if (s.alarme_cond && e.C && e.M)
+        return "VIOLACAO CRITICA: acesso fora de horario COM movimento interno!";
+    if (s.alarme_cond && e.C)
+        return "BLOQUEIO DE PERIODO: credencial valida recusada pelo relogio.";
+    if (s.alarme_cond && (e.M || e.P))
+        return "INTRUSAO: atividade na area restrita fora do expediente!";
+    if (s.sirene)
+        return "ALARME EM MEMORIA: bloqueio central ate rearmar o sistema (opcao 4).";
+    if (s.log_audit && s.trava && !e.M)
+        return "ALERTA XOR (TIMEOUT): credencial aceita, mas ninguem passou.";
+    if (s.log_audit && !s.trava && e.M)
+        return "ALERTA XOR: presenca interna sem credencial no expediente.";
+    if (s.trava && e.M)
+        return "ACESSO AUTORIZADO E CONFIRMADO.";
+    return "STANDBY: perimetro seguro, sem eventos ativos.";
+}
+
+static void painel(Entradas e, int hora, Saidas s, bit q_prev)
+{
+    putchar('\n');
+    borda();
+    linha("NEXUS ACCESS CONTROL   |  TELEMETRIA EM TEMPO REAL");
+    borda();
+    linha("ENTRADAS  C=%d  H=%d [%02dh]  M=%d  P=%d  | Q_ant=%d",
+          e.C, e.H, hora, e.M, e.P, q_prev);
+    borda();
+    linha("MALHA LOGICA");
+    linha("  NOT   /H                    = %d   fora de expediente", s.fora_hora);
+    linha("  AND   C.H                   = %d   credencial no horario", s.cred_ok);
+    linha("  AND   P./TRAVA              = %d   porta forcada", s.forcada);
+    linha("  XOR   TRAVA ^ M             = %d   divergencia fisica", s.diverg);
+    linha("  OR    /H.(C+M+P)+FORCADA    = %d   condicao de alarme", s.alarme_cond);
+    borda();
+    linha("SAIDAS FISICAS");
+    linha("  S1 TRAVA  : %d  %s", s.trava,
+          s.trava ? "ENERGIZADA - PORTA LIBERADA" : "TRANCADA");
+    linha("  S2 SIRENE : %d  %s", s.sirene,
+          s.sirene ? "DISPARADA (memorizada no latch)" : "INATIVA - ARMADO");
+    linha("  S3 LOG    : %d  %s", s.log_audit,
+          s.log_audit ? "ALERTA SILENCIOSO AO GUARDA" : "OPERACAO PADRAO");
+    linha("  S4 CAMERA : %d  %s", s.camera,
+          s.camera ? "GRAVANDO EVENTO" : "STANDBY");
+    borda();
+    printf("\n[DIAGNOSTICO]: %s\n", diagnostico(e, s));
+}
+
+/*
+   Le uma linha inteira, descarta o excedente se ela for maior que o buffer
+   e so aceita se TODA a linha for um numero inteiro dentro de [min, max].
+   Rejeita: letras, "1abc", linha vazia, numeros gigantes (overflow).
+ */
+static int lerInt(const char *msg, int min, int max)
+{
+    char buf[64];
+
+    for (;;) {
+        printf("%s", msg);
+        if (!fgets(buf, sizeof buf, stdin)) {       
+            printf("\n[ENTRADA ENCERRADA]\n");
+            exit(0);
+        }
+
+        size_t n = strlen(buf);
+        if (n > 0 && buf[n - 1] == '\n') {
+            buf[n - 1] = '\0';
+        } else {
+            int ch;                                  // linha longa: descarta o resto
+            while ((ch = getchar()) != '\n' && ch != EOF) { }
+        }
+
+        char *fim;
+        errno = 0;
+        long v = strtol(buf, &fim, 10);
+
+        while (*fim == ' ' || *fim == '\t' || *fim == '\r') fim++;  // espacos finais ok
+
+        if (fim != buf && *fim == '\0' && errno == 0 && v >= min && v <= max)
+            return (int)v;
+
+        printf("   Entrada invalida. Digite um numero inteiro entre %d e %d.\n",
+               min, max);
     }
 }
 
-int main() {
-    int continuar, cartao, hora, movimento;
+// MODO 1: SIMULACAO 
+static void simular(bit *latch)
+{
+    Entradas e;
+    int hora;
+
+    e.C   = lerInt(" > RFID  - Cartao autorizado?  (1/0): ", 0, 1);
+    hora  = lerInt(" > RTC   - Hora de entrada      (0-23): ", 0, 23);
+    e.M   = lerInt(" > PIR   - Movimento interno?  (1/0): ", 0, 1);
+    e.P   = lerInt(" > MAG   - Porta aberta?       (1/0): ", 0, 1);
+
+    e.H = AND_(hora >= EXPEDIENTE_INICIO, hora < EXPEDIENTE_FIM);
+
+    bit q_prev = *latch;
+    Saidas s = avaliar(e, q_prev);
+    *latch = s.sirene;                       // memoria entre ciclos
+    painel(e, hora, s, q_prev);
+}
+
+// MODO 2: TABELA VERDADE COMPLETA 
+static void tabelaVerdade(void)
+{
+    printf("\nTABELA VERDADE (16 combinacoes, latch inicial Q=0)\n");
+    printf("+----+---+---+---+---++-------+--------+-----+--------+\n");
+    printf("| #  | C | H | M | P || TRAVA | SIRENE | LOG | CAMERA |\n");
+    printf("+----+---+---+---+---++-------+--------+-----+--------+\n");
+    for (int i = 0; i < 16; i++) {
+        Entradas e = { (i >> 3) & 1, (i >> 2) & 1, (i >> 1) & 1, i & 1 };
+        Saidas s = avaliar(e, 0);
+        printf("| %02d | %d | %d | %d | %d ||   %d   |   %d    |  %d  |   %d    |\n",
+               i, e.C, e.H, e.M, e.P,
+               s.trava, s.sirene, s.log_audit, s.camera);
+    }
+    printf("+----+---+---+---+---++-------+--------+-----+--------+\n");
+}
+
+// MODO 3: AUTO-VERIFICACAO LOGICA 
+static int falhas, testes;
+
+static void check(int cond, const char *nome)
+{
+    testes++;
+    if (!cond) { falhas++; printf("  [FALHA] %s\n", nome); }
+}
+
+static void autoTeste(void)
+{
+    falhas = testes = 0;
+
+    // 1. Identidades booleanas (De Morgan e XOR)
+    for (bit a = 0; a <= 1; a++)
+        for (bit b = 0; b <= 1; b++) {
+            check(NAND_(a, b) == OR_(NOT_(a), NOT_(b)),  "De Morgan: NAND");
+            check(NOR_(a, b)  == AND_(NOT_(a), NOT_(b)), "De Morgan: NOR");
+            check(XOR_(a, b)  == OR_(AND_(a, NOT_(b)), AND_(NOT_(a), b)),
+                  "XOR = A/B + /AB");
+            check(XNOR_(a, b) == NOT_(XOR_(a, b)),       "XNOR = /XOR");
+        }
+
+    // 2. Invariantes de seguranca em todas as 16 entradas, para Q=0 e Q=1 
+    for (bit q = 0; q <= 1; q++)
+        for (int i = 0; i < 16; i++) {
+            Entradas e = { (i >> 3) & 1, (i >> 2) & 1, (i >> 1) & 1, i & 1 };
+            Saidas s = avaliar(e, q);
+            check(!(s.trava && s.alarme_cond), "trava e alarme nunca juntos");
+            check(!(s.trava && !e.H),          "trava nunca fora do horario");
+            check(!(s.trava && q),             "bloqueio central tranca");
+            check(!s.alarme_cond || s.camera,  "alarme sempre grava");
+            check(!(s.alarme_cond) || s.sirene,"alarme sempre soa sirene");
+        }
+
+    // 3. Comportamento do latch: set, memoria e rearme 
+    Entradas ocioso  = {0, 1, 0, 0};   // expediente, nada acontecendo
+    Entradas intruso = {0, 0, 1, 0};   // fora de hora com movimento
+    bit q = avaliar(intruso, 0).sirene;
+    check(q == 1, "latch: SET por intrusao");
+    q = avaliar(ocioso, q).sirene;
+    check(q == 1, "latch: memoria mantem sirene");
+    q = avaliar(ocioso, 0).sirene;          // apos rearmar (q = 0)
+    check(q == 0, "latch: apos rearme, sem alarme, sirene desliga");
+
+    printf("\nAUTO-TESTE: %d verificacoes, %d falha(s) -> %s\n",
+           testes, falhas, falhas ? "REPROVADO" : "TODAS APROVADAS");
+}
+
+// MAIN 
+int main(void)
+{
+    bit latch = 0;
+    int op;
+
+    printf("\n=====================================================================\n");
+    printf("   NEXUS SECURITY SYSTEMS - SIMULADOR DE CONTROLE DE ACESSO \n");
+    printf("=====================================================================\n");
 
     do {
-        printf("\n=========================================================================\n");
-        printf("   NEXUS SECURITY SYSTEMS - MODULO DE SIMULACAO DE CONTROLE DE ACESSO\n");
-        printf("=========================================================================\n");
+        printf("\n[MENU]  1) Simular ciclo   2) Tabela verdade completa\n");
+        printf("        3) Auto-teste logico   4) Rearmar sistema   0) Sair\n");
+        op = lerInt("Opcao: ", 0, 4);
 
-        do {
-            printf(" > Leitor RFID - Cartao Autorizado? (1 = Sim / 0 = Nao): ");
-            scanf("%d", &cartao);
-        } while (cartao != 0 && cartao != 1);
+        switch (op) {
+            case 1: simular(&latch);   break;
+            case 2: tabelaVerdade();   break;
+            case 3: autoTeste();       break;
+            case 4: latch = 0; printf("\nSistema rearmado: alarme zerado.\n"); break;
+            default: break;
+        }
+    } while (op != 0);
 
-        do {
-            printf(" > Relogio RTC - Hora do Evento (0 a 23): ");
-            scanf("%d", &hora);
-        } while (hora < 0 || hora > 23);
-
-        do {
-            printf(" > Sensor PIR  - Movimento Interno? (1 = Sim / 0 = Nao): ");
-            scanf("%d", &movimento);
-        } while (movimento != 0 && movimento != 1);
-
-        CentralSeguranca resultado = executarMalhaLogica(cartao, hora, movimento);
-        renderizarPainelCorporativo(resultado, hora);
-
-        printf("\nExecutar novo ciclo de teste? (1 = Sim / 0 = Encerrar): ");
-        scanf("%d", &continuar);
-
-    } while (continuar == 1);
-
-    printf("\n[SISTEMA ENCERRADO] Sessao de telemetria finalizada com sucesso.\n");
+    printf("\n[SISTEMA ENCERRADO] Sessao de telemetria finalizada.\n");
     return 0;
 }
